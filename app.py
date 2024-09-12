@@ -1,82 +1,53 @@
-from flask import Flask, Response
-import requests
-import json
-import pandas as pd
+from flask import Flask, Response, request, abort
+import yfinance as yf
 import torch
+import json
 from chronos import ChronosPipeline
 
-# create our Flask app
 app = Flask(__name__)
 
-# define the Hugging Face model we will use
+# 加载 chronos-t5-tiny 模型
 model_name = "amazon/chronos-t5-tiny"
+pipeline = ChronosPipeline.from_pretrained(
+    model_name,
+    device_map="auto",
+    torch_dtype=torch.bfloat16,
+)
 
-def get_coingecko_url(token):
-    base_url = "https://api.coingecko.com/api/v3/coins/"
-    token_map = {
-        'ETH': 'ethereum',
-        'SOL': 'solana',
-        'BTC': 'bitcoin',
-        'BNB': 'binancecoin',
-        'ARB': 'arbitrum'
-    }
-    
-    token = token.upper()
-    if token in token_map:
-        url = f"{base_url}{token_map[token]}/market_chart?vs_currency=usd&days=30&interval=daily"
-        return url
-    else:
-        raise ValueError("Unsupported token")
+# 获取股票历史价格函数
+def get_stock_history(ticker):
+    stock = yf.Ticker(ticker)
+    stock_info = stock.history(period="5d")  # 获取最近5天的股票数据
+    if not stock_info.empty:
+        return stock_info['Close'].tolist()
+    return None
 
-# define our endpoint
-@app.route("/inference/<string:token>")
-def get_inference(token):
-    """Generate inference for given token."""
+# 生成时间序列预测
+def generate_forecast(prices, prediction_length=1):
+    context = torch.tensor(prices)
+    forecast = pipeline.predict(context, prediction_length)
+    return forecast[0].mean().item()
+
+# 股票推理路由，股票代码通过URL参数传递
+@app.route('/inference/<string:ticker>', methods=['GET'])
+def inference(ticker):
     try:
-        # use a pipeline as a high-level helper
-        pipeline = ChronosPipeline.from_pretrained(
-            model_name,
-            device_map="auto",
-            torch_dtype=torch.bfloat16,
-        )
+        # 获取股票历史价格
+        prices = get_stock_history(ticker.upper())
     except Exception as e:
-        return Response(json.dumps({"pipeline error": str(e)}), status=500, mimetype='application/json')
-
+        return Response(json.dumps({"error": str(e)}), status=500, mimetype='application/json')
+    
+    # 如果价格数据不可用，返回404错误
+    if prices is None:
+        abort(404, description="Stock ticker not found or data unavailable")
+    
+    # return render_template('inference.html', ticker=ticker.upper(), prices=prices, forecast_price=forecast_price)
     try:
-        # get the data from Coingecko
-        url = get_coingecko_url(token)
-    except ValueError as e:
-        return Response(json.dumps({"error": str(e)}), status=400, mimetype='application/json')
-
-    headers = {
-        "accept": "application/json",
-        "x-cg-demo-api-key": "<Your Coingecko API key>" # replace with your API key
-    }
-
-    response = requests.get(url, headers=headers)
-    if response.status_code == 200:
-        data = response.json()
-        df = pd.DataFrame(data["prices"])
-        df.columns = ["date", "price"]
-        df["date"] = pd.to_datetime(df["date"], unit='ms')
-        df = df[:-1] # removing today's price
-        print(df.tail(5))
-    else:
-        return Response(json.dumps({"Failed to retrieve data from the API": str(response.text)}), 
-                        status=response.status_code, 
-                        mimetype='application/json')
-
-    # define the context and the prediction length
-    context = torch.tensor(df["price"])
-    prediction_length = 1
-
-    try:
-        forecast = pipeline.predict(context, prediction_length)  # shape [num_series, num_samples, prediction_length]
-        print(forecast[0].mean().item()) # taking the mean of the forecasted prediction
-        return Response(str(forecast[0].mean().item()), status=200)
+        # 生成未来一天的预测
+        forecast_price = generate_forecast(prices, prediction_length=1)
+        return Response(str(forecast_price), status=200)
     except Exception as e:
         return Response(json.dumps({"error": str(e)}), status=500, mimetype='application/json')
 
-# run our Flask app
 if __name__ == '__main__':
-    app.run(host="0.0.0.0", port=8000, debug=True)
+    app.run(debug=True, port=8000)
